@@ -1,0 +1,12 @@
+{
+  "targets": [
+    {
+      "type": "application",
+      "id": "REMPLACER_PAR_ID_DOKPLOY",
+      "service": "api",
+      "repository": "owner/repository",
+      "environment": "staging",
+      "environmentUrl": ""
+    }
+  ]
+}

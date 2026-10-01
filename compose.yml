@@ -1,0 +1,13 @@
+services:
+  tracker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - tracker-data:/app/data
+
+volumes:
+  tracker-data:
