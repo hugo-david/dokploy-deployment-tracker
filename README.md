@@ -6,7 +6,7 @@ Synchronise les déploiements **Dokploy** avec le journal **GitHub Deployments**
 Notification Dokploy → Deployment Tracker → GitHub Deployments
 ```
 
-Le service conserve le commit, le résultat et les dates Dokploy de chaque déploiement. API et frontend peuvent partager un environnement (`staging`, `test`, `preprod`) tout en gardant leurs entrées distinctes : `deploy:api` et `deploy:web`.
+Le service conserve le commit, le résultat et les dates Dokploy de chaque déploiement. API et frontend partagent une seule entrée par **environnement et commit** (`staging`, `test`, `preprod`). Un redéploiement du même commit met à jour le résultat de cette entrée.
 
 ## Installation
 
@@ -28,7 +28,7 @@ Utiliser la clé générée comme `WEBHOOK_SECRET`, puis renseigner `.env` :
 | `GITHUB_TOKEN` | Token du dépôt cible, **Deployments → Read and write** |
 | `WEBHOOK_SECRET` | Secret partagé avec la notification Dokploy |
 | `DRY_RUN` | `true` pour simuler, `false` pour écrire dans GitHub |
-| `SYNC_INTERVAL_SECONDS` | Intervalle de rattrapage, `300` par défaut ; `0` désactive le timer |
+| `SYNC_INTERVAL_SECONDS` | Intervalle de rattrapage, `86400` par défaut ; `0` désactive le timer |
 
 Dans `config.json`, déclarer les services à suivre :
 
@@ -66,10 +66,10 @@ pnpm sync --target ID_APPLICATION_DOKPLOY --deployment ID_DEPLOIEMENT_DOKPLOY
 pnpm start
 ```
 
-Ajouter `--dry-run` à une commande pour la simuler. `DRY_RUN=true` dans `.env` impose aussi la simulation. Les imports existants sont reconnus pour éviter les doublons. Le filtre `--since` utilise la date de fin Dokploy, ou la date de création si elle manque.
+Ajouter `--dry-run` à une commande pour la simuler. `DRY_RUN=true` dans `.env` impose aussi la simulation. Les imports existants sont reconnus pour éviter les doublons. Le filtre `--since` utilise la dernière date de fin du groupe, ou la date de création si elle manque. `--target` sélectionne l’environnement complet du service ; `--deployment` limite au commit de cette tentative, en consultant aussi les autres services attendus.
 
 > [!IMPORTANT]
-> Le serveur synchronise tout l’historique disponible au démarrage, puis à chaque notification et toutes les cinq minutes. Arrêter le serveur avant un import manuel : une seule instance doit utiliser le fichier d’état.
+> Le serveur synchronise tout l’historique disponible au démarrage, puis à chaque notification et toutes les 24 heures par défaut. Arrêter le serveur avant un import manuel : une seule instance doit utiliser le fichier d’état.
 
 ## Notification Dokploy
 
@@ -100,10 +100,22 @@ Pour une **Application Dokploy**, construire le Dockerfile, fournir les variable
 
 `GET /health` vérifie que le serveur écoute. Les résultats et erreurs de synchronisation sont disponibles dans les logs.
 
-## À savoir
+## Résultats regroupés
 
-- Seul l’historique encore conservé dans Dokploy est récupérable. Les previews, déploiements non terminés et entrées sans commit exact sont ignorés.
-- GitHub affiche la date d’import. Les dates d’origine restent dans `payload.dokployCreatedAt` et `payload.dokployFinishedAt` : utiliser ces dates pour les bilans mensuels.
+- **Succès** : la dernière tentative de chaque service configuré pour ce commit a réussi.
+- **Échec** : au moins un service a échoué ou a été annulé, même si un autre manque encore.
+- **Aucun résultat intermédiaire** : tant que le groupe est incomplet ou qu’un service est en cours sans échec, aucune nouvelle entrée ni statut n’est publié. Lors d’une nouvelle tentative, le dernier résultat final reste affiché jusqu’au suivant.
+
+La dernière tentative de chaque service est conservée dans le volume, y compris les tentatives en cours, pour éviter de reprendre un ancien succès après un échec ou pendant un redéploiement. Un groupe est défini par les services du même dépôt et environnement dans `config.json` : déclarer seulement les services réellement attendus pour cette livraison.
+
+GitHub conserve les résultats successifs comme statuts de **la même entrée**. Les logs distinguent `created`, `updated`, `recovered` et `unchanged` ; `waiting` compte les groupes sans résultat final et `failed` les erreurs de synchronisation.
+
+## Compatibilité et limites
+
+- L’ancien fichier d’état est migré automatiquement et sauvegardé dans `data/state.json.v1.bak` avant toute écriture. Pour un commit déjà enregistré, le script reprend une entrée existante, sans créer une troisième ligne. Les anciennes lignes séparées restent dans le journal ; cette version ne les supprime pas.
+- Une seule instance doit fonctionner à la fois. Dans Dokploy Swarm, utiliser une mise à jour **stop-first** pour éviter un chevauchement de l’ancienne et de la nouvelle instance pendant le déploiement.
+- Seul l’historique encore conservé dans Dokploy ou le volume local est récupérable. Les previews et entrées sans commit exact sont ignorées.
+- GitHub affiche la date d’import. Le `payload` conserve les services et dates à la création de l’entrée et ne peut pas être modifié ; après un redéploiement, utiliser les descriptions des statuts et `data/state.json` pour les résultats et dates actualisés. Une entrée héritée conserve son ancien `payload` par service.
 - `success` correspond au résultat Dokploy, sans contrôle supplémentaire de santé de l’application. Le service ne gère pas la désactivation des anciennes entrées GitHub.
 - Le rapprochement automatique avec les PR et issues et la génération du PV mensuel ne sont pas encore implémentés.
 - Conserver les secrets dans `.env` ou les variables Dokploy ; `.env` et `data/` sont exclus de Git et de l’image Docker.

@@ -1,29 +1,42 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { createHttpServer } from "./server.mjs";
+import { groupedDeployments, latestAttempts, sourceKey } from "./grouping.mjs";
 
 const args = process.argv.slice(2);
 const command = args.shift() ?? "serve";
 if (!["serve", "sync"].includes(command) || args.includes("--help")) {
- console.log("pnpm start | pnpm sync [--dry-run] [--since YYYY-MM-DD] [--target ID --deployment ID]");
- process.exit(args.includes("--help") ? 0 : 1);
+	console.log(
+		"pnpm start | pnpm sync [--dry-run] [--since YYYY-MM-DD] [--target ID --deployment ID]",
+	);
+	process.exit(args.includes("--help") ? 0 : 1);
 }
 const options = new Map();
 for (let index = 0; index < args.length; index++) {
- const option = args[index];
- if (options.has(option)) throw new Error(`Option répétée : ${option}`);
- if (option === "--dry-run") { options.set(option, true); continue; }
- if (!["--since", "--target", "--deployment"].includes(option)) throw new Error(`Option inconnue : ${option}`);
- const value = args[++index];
- if (!value || value.startsWith("--")) throw new Error(`Valeur manquante : ${option}`);
- options.set(option, value);
+	const option = args[index];
+	if (options.has(option)) throw new Error(`Option répétée : ${option}`);
+	if (option === "--dry-run") {
+		options.set(option, true);
+		continue;
+	}
+	if (!["--since", "--target", "--deployment"].includes(option))
+		throw new Error(`Option inconnue : ${option}`);
+	const value = args[++index];
+	if (!value || value.startsWith("--"))
+		throw new Error(`Valeur manquante : ${option}`);
+	options.set(option, value);
 }
-const since = options.has("--since") ? Date.parse(options.get("--since")) : undefined;
-if (since !== undefined && !Number.isFinite(since)) throw new Error("Date --since invalide.");
+const since = options.has("--since")
+	? Date.parse(options.get("--since"))
+	: undefined;
+if (since !== undefined && !Number.isFinite(since))
+	throw new Error("Date --since invalide.");
 const targetId = options.get("--target");
 const deploymentId = options.get("--deployment");
-if (deploymentId && !targetId) throw new Error("--deployment nécessite --target.");
-if (command === "serve" && options.size) throw new Error("Les filtres sont réservés à la commande sync.");
+if (deploymentId && !targetId)
+	throw new Error("--deployment nécessite --target.");
+if (command === "serve" && options.size)
+	throw new Error("Les filtres sont réservés à la commande sync.");
 const dryRun = args.includes("--dry-run") || process.env.DRY_RUN === "true";
 const statePath = resolve(process.env.STATE_FILE ?? "./data/state.json");
 const dokployUrl = new URL(required("DOKPLOY_URL"));
@@ -83,17 +96,48 @@ for (const [index, target] of config.targets.entries()) {
 	if (target.environmentUrl) new URL(target.environmentUrl);
 }
 
-const selectedTargets = targetId ? config.targets.filter((target) => target.id === targetId) : config.targets;
-if (!selectedTargets.length) throw new Error("Cible --target introuvable dans config.json.");
+const selectedTargets = targetId
+	? config.targets.filter((target) => target.id === targetId)
+	: config.targets;
+if (!selectedTargets.length)
+	throw new Error("Cible --target introuvable dans config.json.");
 
-let state = { version: 1, deployments: {} };
+let state = { version: 2, groups: {}, sources: {} };
+let legacyState;
 try {
-	state = JSON.parse(await readFile(statePath, "utf8"));
+	const saved = await readFile(statePath, "utf8");
+	state = JSON.parse(saved);
 	if (
-		state.version !== 1 ||
-		!state.deployments ||
-		Array.isArray(state.deployments) ||
-		typeof state.deployments !== "object"
+		state.version === 1 &&
+		state.deployments &&
+		typeof state.deployments === "object" &&
+		!Array.isArray(state.deployments)
+	) {
+		legacyState = saved;
+		const sources = {};
+		for (const [key, record] of Object.entries(state.deployments)) {
+			const [source, type, id, repository, environment] = JSON.parse(key);
+			const target = config.targets.find(
+				(target) =>
+					target.type === type &&
+					target.id === id &&
+					target.repository === repository &&
+					target.environment === environment,
+			);
+			if (!target || source !== dokployUrl.origin || !record.sha) continue;
+			const identity = sourceKey(target, source);
+			sources[identity] = latestAttempts([record], sources[identity]);
+		}
+		state = { version: 2, groups: {}, sources };
+	}
+	if (
+		state.version !== 2 ||
+		!state.groups ||
+		!state.sources ||
+		typeof state.groups !== "object" ||
+		typeof state.sources !== "object" ||
+		Array.isArray(state.groups) ||
+		Array.isArray(state.sources)
 	)
 		throw new Error("Fichier d’état invalide.");
 } catch (error) {
@@ -101,6 +145,7 @@ try {
 }
 let queue = Promise.resolve();
 let periodicPending = false;
+let syncRequested = false;
 
 function required(name) {
 	const value = process.env[name];
@@ -110,7 +155,12 @@ function required(name) {
 
 function log(event, details = {}) {
 	console.log(
-		JSON.stringify({ timestamp: new Date().toISOString(), event, ...details }),
+		JSON.stringify({
+			level: event.endsWith("failed") ? 50 : event === "skipped" ? 40 : 30,
+			timestamp: new Date().toISOString(),
+			event,
+			...details,
+		}),
 	);
 }
 
@@ -146,6 +196,17 @@ function github(path, body) {
 
 async function saveState() {
 	await mkdir(dirname(statePath), { recursive: true });
+	if (legacyState) {
+		try {
+			await writeFile(`${statePath}.v1.bak`, legacyState, {
+				flag: "wx",
+				mode: 0o600,
+			});
+		} catch (error) {
+			if (error.code !== "EEXIST") throw error;
+		}
+		legacyState = undefined;
+	}
 	const temporary = `${statePath}.tmp`;
 	await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, {
 		mode: 0o600,
@@ -154,10 +215,9 @@ async function saveState() {
 }
 
 function normalize(record) {
-	const status = { done: "success", error: "failure", cancelled: "error" }[
+	const status = { done: "success", error: "failure", cancelled: "failure" }[
 		record.status
 	];
-	if (!status) return { skip: "Déploiement non terminé" };
 	if (record.isPreviewDeployment) return { skip: "Preview ignorée" };
 	if (typeof record.deploymentId !== "string" || !record.deploymentId) {
 		throw new Error("Réponse Dokploy sans deploymentId.");
@@ -179,11 +239,18 @@ function normalize(record) {
 	) {
 		return { skip: "Date Dokploy invalide" };
 	}
-	return { id: record.deploymentId, sha, status, createdAt, finishedAt };
+	return {
+		id: record.deploymentId,
+		sha: sha.toLowerCase(),
+		status: status ?? null,
+		createdAt,
+		finishedAt,
+	};
 }
 
-async function remoteDeployments(target) {
+async function remoteDeployments(targets) {
 	const deployments = new Map();
+	const target = targets[0];
 	for (let page = 1; ; page++) {
 		const query = new URLSearchParams({
 			environment: target.environment,
@@ -204,12 +271,25 @@ async function remoteDeployments(target) {
 				}
 			}
 			if (
-				payload?.tracker === "dokploy-deployment-tracker" &&
-				payload.source === dokployUrl.origin &&
-				payload.serviceId === target.id &&
-				payload.serviceType === target.type
+				payload?.tracker !== "dokploy-deployment-tracker" ||
+				payload.source !== dokployUrl.origin
+			)
+				continue;
+			const grouped = payload.mode === "environment-commit";
+			const legacy = targets.some(
+				(target) =>
+					payload.serviceId === target.id &&
+					payload.serviceType === target.type,
+			);
+			if (!grouped && !legacy) continue;
+			const previous = deployments.get(item.sha);
+			// Préférer une entrée regroupée, sinon reprendre l’ancienne entrée la plus ancienne.
+			if (
+				!previous ||
+				(grouped && !previous.grouped) ||
+				(grouped === previous.grouped && item.id < previous.id)
 			) {
-				deployments.set(payload.dokployDeploymentId, item);
+				deployments.set(item.sha, { ...item, grouped });
 			}
 		}
 		if (items.length < 100) return deployments;
@@ -217,109 +297,146 @@ async function remoteDeployments(target) {
 }
 
 async function sync() {
-	const summary = { imported: 0, unchanged: 0, skipped: 0, failed: 0, dryRun };
+	const summary = {
+		created: 0,
+		updated: 0,
+		recovered: 0,
+		unchanged: 0,
+		waiting: 0,
+		skipped: 0,
+		failed: 0,
+		dryRun,
+	};
+	const environments = new Map();
 	for (const target of selectedTargets) {
+		const key = JSON.stringify([target.repository, target.environment]);
+		// Un filtre sur un service sélectionne son environnement complet : ne jamais publier un succès partiel.
+		environments.set(
+			key,
+			config.targets.filter(
+				(candidate) =>
+					candidate.repository === target.repository &&
+					candidate.environment === target.environment,
+			),
+		);
+	}
+	for (const targets of environments.values()) {
+		const target = targets[0];
 		try {
-			const endpoint =
-				target.type === "application"
-					? "deployment.all"
-					: "deployment.allByCompose";
-			const url = new URL(`/api/${endpoint}`, dokployUrl);
-			url.searchParams.set(
-				target.type === "application" ? "applicationId" : "composeId",
-				target.id,
-			);
-			const records = await request(url, { "x-api-key": dokployKey });
-			if (!Array.isArray(records))
-				throw new Error("Réponse Dokploy inattendue : tableau attendu.");
-			if (deploymentId && !records.some((record) => record.deploymentId === deploymentId))
-                throw new Error("Déploiement --deployment introuvable pour cette cible.");
-            const remote = dryRun ? new Map() : await remoteDeployments(target);
-			records.sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
-			for (const record of records) {
-                if (deploymentId && record.deploymentId !== deploymentId) continue;
+			const sources = { ...state.sources };
+			let selectedSha;
+			for (const service of targets) {
+				const endpoint =
+					service.type === "application"
+						? "deployment.all"
+						: "deployment.allByCompose";
+				const url = new URL(`/api/${endpoint}`, dokployUrl);
+				url.searchParams.set(
+					service.type === "application" ? "applicationId" : "composeId",
+					service.id,
+				);
+				const records = await request(url, { "x-api-key": dokployKey });
+				if (!Array.isArray(records))
+					throw new Error("Réponse Dokploy inattendue : tableau attendu.");
+				if (deploymentId && service.id === targetId) {
+					const selected = records.find(
+						(record) => record.deploymentId === deploymentId,
+					);
+					if (!selected)
+						throw new Error(
+							"Déploiement --deployment introuvable pour cette cible.",
+						);
+					const normalized = normalize(selected);
+					if (normalized.skip) throw new Error(normalized.skip);
+					selectedSha = normalized.sha;
+				}
+				const normalized = [];
+				for (const record of records) {
+					const deployment = normalize(record);
+					if (deployment.skip) {
+						summary.skipped++;
+						log("skipped", {
+							service: service.service,
+							id: record.deploymentId,
+							reason: deployment.skip,
+						});
+					} else normalized.push(deployment);
+				}
+				const key = sourceKey(service, dokployUrl.origin);
+				sources[key] = latestAttempts(normalized, sources[key]);
+			}
+			if (!dryRun) {
+				state.sources = sources;
+				await saveState();
+			}
+			const remote = dryRun ? new Map() : await remoteDeployments(targets);
+			for (const deployment of groupedDeployments(
+				targets,
+				sources,
+				dokployUrl.origin,
+			)) {
+				if (selectedSha && deployment.sha !== selectedSha) continue;
 				if (
 					since !== undefined &&
-					Date.parse(record.finishedAt || record.createdAt) < since
+					Date.parse(deployment.finishedAt ?? deployment.createdAt) < since
 				)
 					continue;
-				const deployment = normalize(record);
-				if (deployment.skip) {
-					summary.skipped++;
-					log("skipped", {
-						service: target.service,
-						id: record.deploymentId,
-						reason: deployment.skip,
-					});
+				if (!deployment.status) {
+					summary.waiting++;
 					continue;
 				}
 				const key = JSON.stringify([
 					dokployUrl.origin,
-					target.type,
-					target.id,
 					target.repository,
 					target.environment,
-					deployment.id,
-				]);
-				const previous = state.deployments[key];
-				const fingerprint = JSON.stringify([
 					deployment.sha,
-					deployment.status,
-					deployment.createdAt,
-					deployment.finishedAt,
 				]);
+				const fingerprint = JSON.stringify(deployment);
+				const previous = state.groups[key];
 				if (previous?.fingerprint === fingerprint && previous.complete) {
 					summary.unchanged++;
 					continue;
 				}
 				try {
 					if (dryRun) {
-						log("would_import", {
-							service: target.service,
+						log("would_sync", {
 							environment: target.environment,
 							...deployment,
 						});
-						summary.imported++;
 						continue;
 					}
-					const recovered = remote.get(deployment.id);
+					const recovered = remote.get(deployment.sha);
 					let githubId = previous?.githubId ?? recovered?.id;
-					if (recovered && recovered.sha !== deployment.sha)
-						throw new Error(
-							"Commit différent dans le déploiement GitHub existant.",
-						);
+					let created = false;
 					if (!githubId) {
-						const created = await github(
+						const result = await github(
 							`/repos/${target.repository}/deployments`,
 							{
 								ref: deployment.sha,
 								environment: target.environment,
-								task: `deploy:${target.service}`,
+								task: "deploy",
 								auto_merge: false,
 								required_contexts: [],
-								production_environment: target.production === true,
-								description:
-									`${target.service} · Dokploy · ${deployment.finishedAt ?? deployment.createdAt}`.slice(
-										0,
-										140,
-									),
+								production_environment: targets.some(
+									(target) => target.production === true,
+								),
+								description: `Dokploy · ${deployment.finishedAt}`,
 								payload: {
 									tracker: "dokploy-deployment-tracker",
+									mode: "environment-commit",
 									source: dokployUrl.origin,
-									serviceId: target.id,
-									serviceType: target.type,
-									dokployDeploymentId: deployment.id,
 									dokployCreatedAt: deployment.createdAt,
 									dokployFinishedAt: deployment.finishedAt,
-									service: target.service,
+									services: deployment.services,
 								},
 							},
 						);
-						if (!Number.isInteger(created.id))
+						if (!Number.isInteger(result.id))
 							throw new Error("GitHub n’a pas créé de déploiement.");
-						githubId = created.id;
+						githubId = result.id;
+						created = true;
 					}
-					state.deployments[key] = {
+					state.groups[key] = {
 						...deployment,
 						githubId,
 						fingerprint,
@@ -329,51 +446,66 @@ async function sync() {
 					const statuses = await github(
 						`/repos/${target.repository}/deployments/${githubId}/statuses?per_page=1`,
 					);
-					const description =
-						`Dokploy ${deployment.status} · ${deployment.finishedAt ?? deployment.createdAt}`.slice(
-							0,
-							140,
-						);
 					if (!Array.isArray(statuses))
 						throw new Error("Réponse des statuts GitHub inattendue.");
-					if (
+					const services = deployment.services
+						.map(
+							({ service, deployment }) =>
+								`${service}:${deployment?.status ?? "absent/en cours"}`,
+						)
+						.join(" ");
+					const description =
+						`Dokploy ${deployment.finishedAt} · ${services}`.slice(0, 140);
+					const changed =
 						statuses[0]?.state !== deployment.status ||
-						statuses[0]?.description !== description
-					) {
+						statuses[0]?.description !== description;
+					if (changed) {
+						// Ajouter un résultat à la même entrée ; aucune nouvelle ligne pour un redéploiement du commit.
 						await github(
 							`/repos/${target.repository}/deployments/${githubId}/statuses`,
 							{
 								state: deployment.status,
 								description,
-								// Un import ancien ne doit pas désactiver une livraison récente.
 								auto_inactive: false,
-								...(target.environmentUrl
-									? { environment_url: target.environmentUrl }
+								...(targets.find(
+									(target) => target.service === "web" && target.environmentUrl,
+								)?.environmentUrl
+									? {
+											environment_url: targets.find(
+												(target) =>
+													target.service === "web" && target.environmentUrl,
+											).environmentUrl,
+										}
 									: {}),
 							},
 						);
 					}
-					state.deployments[key].complete = true;
+					state.groups[key].complete = true;
 					await saveState();
-					summary.imported++;
-					log("imported", {
-						service: target.service,
+					const event = created ? "created" : changed ? "updated" : "recovered";
+					summary[event]++;
+					log(event, {
 						environment: target.environment,
-						...deployment,
+						sha: deployment.sha,
+						status: deployment.status,
+						finishedAt: deployment.finishedAt,
 						githubId,
 					});
 				} catch (error) {
 					summary.failed++;
 					log("import_failed", {
-						service: target.service,
-						id: deployment.id,
+						environment: target.environment,
+						sha: deployment.sha,
 						message: error.message,
 					});
 				}
 			}
 		} catch (error) {
 			summary.failed++;
-			log("target_failed", { service: target.service, message: error.message });
+			log("target_failed", {
+				environment: target.environment,
+				message: error.message,
+			});
 		}
 	}
 	log("sync_complete", summary);
@@ -393,7 +525,7 @@ if (command === "sync") {
 	process.exitCode = result.failed > 0 ? 1 : 0;
 } else {
 	const secret = required("WEBHOOK_SECRET");
-	const interval = Number(process.env.SYNC_INTERVAL_SECONDS ?? 300);
+	const interval = Number(process.env.SYNC_INTERVAL_SECONDS ?? 86400);
 	const port = Number(process.env.PORT ?? 3000);
 	if (
 		!Number.isInteger(interval) ||
@@ -405,15 +537,27 @@ if (command === "sync") {
 		throw new Error("PORT ou SYNC_INTERVAL_SECONDS invalide.");
 	}
 	let closing = false;
-	const server = createHttpServer({ secret, dryRun, onNotification: scheduleSync });
+	const server = createHttpServer({
+		secret,
+		dryRun,
+		onNotification: scheduleSync,
+	});
 	function scheduleSync() {
-		if (closing || periodicPending) return;
+		if (closing) return;
+		syncRequested = true;
+		if (periodicPending) return;
 		periodicPending = true;
-		enqueueSync()
+		enqueueRequestedSyncs()
 			.finally(() => {
 				periodicPending = false;
 			})
 			.catch(() => {});
+	}
+	async function enqueueRequestedSyncs() {
+		while (syncRequested && !closing) {
+			syncRequested = false;
+			await enqueueSync();
+		}
 	}
 	const timer =
 		interval > 0 ? setInterval(scheduleSync, interval * 1000) : undefined;
