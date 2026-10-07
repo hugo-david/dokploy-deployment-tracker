@@ -1,0 +1,320 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { readFile } from "node:fs/promises";
+import {
+	createBacklogClient,
+	syncBacklog,
+	validateBacklog,
+} from "../src/backlog.mjs";
+import { groupedDeployments, sourceKey } from "../src/grouping.mjs";
+
+const config = JSON.parse(
+	await readFile(new URL("../config.example.json", import.meta.url)),
+).backlog;
+const repo = "drakkr-team/2i-group-studio";
+const sha = (n) => n.toString(16).padStart(40, "0");
+function item(number = 1, status = "In review") {
+	return {
+		id: `item${number}`,
+		isArchived: false,
+		fieldValueByName: { name: status },
+		content: {
+			__typename: "Issue",
+			id: `issue${number}`,
+			number,
+			title: "Ticket",
+			url: `https://github.com/${repo}/issues/${number}`,
+			repository: { nameWithOwner: repo },
+		},
+	};
+}
+function pr(number = 1, fields = {}) {
+	return {
+		number,
+		url: `https://github.com/${repo}/pull/${number}`,
+		repository: { nameWithOwner: repo },
+		baseRefName: "dev",
+		state: "MERGED",
+		mergeCommit: { oid: sha(number) },
+		...fields,
+	};
+}
+function deployment(environment, n, fields = {}) {
+	return {
+		repository: repo,
+		environment,
+		sha: sha(n),
+		status: "success",
+		finishedAt: "2026-10-01T12:00:00Z",
+		...fields,
+	};
+}
+function fixture({
+	items = [item()],
+	prs = [pr()],
+	contains = async () => true,
+	...overrides
+} = {}) {
+	const updates = [];
+	const client = {
+		project: async () => ({ id: "project", title: "Backlog" }),
+		items: async () => items,
+		pullRequests: async () => prs,
+		contains,
+		item: async (id) => items.find((i) => i.id === id),
+		update: async (...args) => updates.push(args),
+		...overrides,
+	};
+	return { client, updates };
+}
+const run = (f, deployments, dryRun = true) =>
+	syncBacklog({ config, client: f.client, deployments, dryRun });
+
+test("configuration : ordre explicite, statuts protégés et doublons", () => {
+	validateBacklog(config);
+	validateBacklog(undefined);
+	assert.throws(() =>
+		validateBacklog({
+			...config,
+			stages: [...config.stages, config.stages[0]],
+		}),
+	);
+	assert.throws(() => validateBacklog({ ...config, protectedStatuses: [] }));
+});
+
+test("squash conservé par les promotions : choisit le plus haut succès, sans écriture en simulation", async () => {
+	const f = fixture({
+		contains: async (_, ancestor, head) =>
+			ancestor === sha(1) && [sha(10), sha(20)].includes(head),
+	});
+	const result = await run(f, [
+		deployment("staging", 10),
+		deployment("test", 20),
+		deployment("preprod", 30, { status: "failure" }),
+	]);
+	assert.equal(result.rows[0].to, "In TEST");
+	assert.equal(result.rows[0].outcome, "would_update");
+	assert.equal(result.rows[0].evidence[0].pullRequests[0].sha, sha(1));
+	assert.equal(result.rows[0].evidence[0].sha, sha(20));
+	assert.equal(f.updates.length, 0);
+});
+
+test("un merge de promotion ne prouve pas la présence d'un squash absent", async () => {
+	const result = await run(fixture({ contains: async () => false }), [
+		deployment("preprod", 30),
+	]);
+	assert.equal(result.rows[0].to, null);
+});
+
+test("un succès API seul ne déplace aucun ticket", async () => {
+	const targets = ["api", "web"].map((service) => ({
+		repository: repo,
+		environment: "test",
+		service,
+		id: service,
+		type: "application",
+	}));
+	const sources = {
+		[sourceKey(targets[0], "https://dokploy")]: {
+			[sha(1)]: {
+				id: "api1",
+				sha: sha(1),
+				status: "success",
+				createdAt: "2026-10-01T12:00:00Z",
+			},
+		},
+	};
+	const grouped = groupedDeployments(targets, sources, "https://dokploy").map(
+		(d) => ({ ...d, repository: repo, environment: "test" }),
+	);
+	assert.equal((await run(fixture(), grouped)).summary.would_update, 0);
+});
+
+test("toutes les PR doivent coexister dans une même version", async () => {
+	const f = fixture({
+		prs: [pr(1), pr(2)],
+		contains: async (_, ancestor, head) =>
+			(head === sha(10) && ancestor === sha(1)) ||
+			(head === sha(20) && ancestor === sha(2)),
+	});
+	assert.equal(
+		(await run(f, [deployment("test", 10), deployment("test", 20)])).rows[0].to,
+		null,
+	);
+});
+
+test("PR ouverte, liens absents ou promotion liée : laisse le ticket en place", async () => {
+	for (const [prs, reason] of [
+		[[], "no_linked_pr"],
+		[[pr(1, { state: "OPEN" })], "unmerged_pr"],
+		[[pr(1, { baseRefName: "test" })], "unsupported_pr"],
+	]) {
+		const result = await run(fixture({ prs }), [deployment("test", 10)]);
+		assert.equal(result.rows[0].reason, reason);
+	}
+});
+
+test("une PR abandonnée ne bloque pas la PR de remplacement fusionnée", async () => {
+	const result = await run(
+		fixture({ prs: [pr(), pr(2, { state: "CLOSED", mergeCommit: null })] }),
+		[deployment("test", 10)],
+	);
+	assert.equal(result.rows[0].to, "In TEST");
+});
+
+test("ne rétrograde pas, protège Closed, Canceled, les archives et les statuts inconnus", async () => {
+	for (const status of [
+		"In PREPROD",
+		"In PROD",
+		"Closed",
+		"Canceled",
+		"Custom",
+		null,
+	]) {
+		const f = fixture({ items: [item(1, status)] });
+		assert.equal(
+			(await run(f, [deployment("test", 10)], false)).summary.updated,
+			0,
+		);
+		assert.equal(f.updates.length, 0);
+	}
+	const archived = { ...item(), isArchived: true };
+	assert.equal(
+		(await run(fixture({ items: [archived] }), [deployment("test", 10)]))
+			.rows[0].reason,
+		"archived",
+	);
+});
+
+test("une issue GitHub fermée reste livrable si le statut du projet est actif", async () => {
+	const issue = item();
+	issue.content.state = "CLOSED";
+	assert.equal(
+		(await run(fixture({ items: [issue] }), [deployment("test", 10)])).rows[0]
+			.to,
+		"In TEST",
+	);
+});
+
+test("relit statut et liens avant écriture, puis ne répète pas une mise à jour déjà appliquée", async () => {
+	const original = item();
+	const f = fixture({
+		items: [original],
+		update: async (_, id, status) => {
+			assert.equal(id, original.id);
+			original.fieldValueByName.name = status;
+		},
+	});
+	assert.equal(
+		(await run(f, [deployment("test", 10)], false)).summary.updated,
+		1,
+	);
+	assert.equal(
+		(await run(f, [deployment("test", 10)], false)).summary.updated,
+		0,
+	);
+	const changed = fixture({ item: async () => item(1, "Canceled") });
+	assert.equal(
+		(await run(changed, [deployment("test", 10)], false)).rows[0].reason,
+		"changed_during_sync",
+	);
+	assert.equal(changed.updates.length, 0);
+	let calls = 0;
+	const relinked = fixture({
+		pullRequests: async () =>
+			++calls === 1 ? [pr()] : [pr(), pr(2, { state: "OPEN" })],
+	});
+	assert.equal(
+		(await run(relinked, [deployment("test", 10)], false)).rows[0].reason,
+		"changed_during_sync",
+	);
+	assert.equal(relinked.updates.length, 0);
+});
+
+test("erreur Projects réessayable sans rejouer un déploiement", async () => {
+	let failures = 1;
+	const f = fixture({
+		update: async () => {
+			if (failures--) throw new Error("HTTP 503");
+		},
+	});
+	assert.equal(
+		(await run(f, [deployment("test", 10)], false)).summary.failed,
+		1,
+	);
+	assert.equal(
+		(await run(f, [deployment("test", 10)], false)).summary.updated,
+		1,
+	);
+});
+
+test("cache partagé entre tickets d'une même PR", async () => {
+	let calls = 0;
+	const f = fixture({
+		items: [item(1), item(2)],
+		contains: async () => {
+			calls++;
+			return true;
+		},
+	});
+	assert.equal(
+		(await run(f, [deployment("test", 10)])).summary.would_update,
+		2,
+	);
+	assert.equal(calls, 1);
+});
+
+test("arrête les écritures après un refus de permission pour éviter les appels inutiles", async () => {
+	let calls = 0;
+	const f = fixture({
+		items: [item(1), item(2)],
+		update: async () => {
+			calls++;
+			const error = new Error("INSUFFICIENT_SCOPES");
+			error.code = "INSUFFICIENT_SCOPES";
+			throw error;
+		},
+	});
+	const result = await run(f, [deployment("test", 10)], false);
+	assert.equal(result.summary.failed, 1);
+	assert.equal(result.rows[1].reason, "access_blocked");
+	assert.equal(calls, 1);
+});
+
+test("comparaison GitHub : seuls ahead et identical prouvent l'inclusion", async () => {
+	for (const status of ["ahead", "identical", "behind", "diverged"]) {
+		const client = createBacklogClient(async (path) => {
+			assert.match(path, /compare\/.*\.\.\./);
+			return { status };
+		});
+		assert.equal(
+			await client.contains(repo, sha(1), sha(2)),
+			["ahead", "identical"].includes(status),
+		);
+	}
+});
+
+test("pagination complète des tickets et PR, erreurs GraphQL même HTTP 200", async () => {
+	let calls = 0;
+	const client = createBacklogClient(async (_, { variables }) => {
+		calls++;
+		const page = {
+			nodes: [variables.cursor ? { id: "second" } : { id: "first" }],
+			pageInfo: {
+				hasNextPage: !variables.cursor,
+				endCursor: variables.cursor ? null : "next",
+			},
+		};
+		return {
+			data: { node: { items: page, closedByPullRequestsReferences: page } },
+		};
+	});
+	assert.equal((await client.items("project", "Status")).length, 2);
+	assert.equal((await client.pullRequests("issue")).length, 2);
+	assert.equal(calls, 4);
+	const denied = createBacklogClient(async () => ({
+		data: { organization: null },
+		errors: [{ type: "FORBIDDEN" }],
+	}));
+	await assert.rejects(denied.project(config), /FORBIDDEN/);
+});

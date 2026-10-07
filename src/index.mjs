@@ -2,12 +2,20 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { createHttpServer } from "./server.mjs";
 import { groupedDeployments, latestAttempts, sourceKey } from "./grouping.mjs";
+import {
+	createBacklogClient,
+	syncBacklog,
+	validateBacklog,
+} from "./backlog.mjs";
 
 const args = process.argv.slice(2);
 const command = args.shift() ?? "serve";
-if (!["serve", "sync"].includes(command) || args.includes("--help")) {
+if (
+	!["serve", "sync", "backfill"].includes(command) ||
+	args.includes("--help")
+) {
 	console.log(
-		"pnpm start | pnpm sync [--dry-run] [--since YYYY-MM-DD] [--target ID --deployment ID]",
+		"pnpm start | pnpm sync [--dry-run] [--since YYYY-MM-DD] [--target ID --deployment ID]\npnpm backfill [--dry-run | --apply] [--report PATH] [--since YYYY-MM-DD] [--target ID --deployment ID]",
 	);
 	process.exit(args.includes("--help") ? 0 : 1);
 }
@@ -15,11 +23,11 @@ const options = new Map();
 for (let index = 0; index < args.length; index++) {
 	const option = args[index];
 	if (options.has(option)) throw new Error(`Option répétée : ${option}`);
-	if (option === "--dry-run") {
+	if (["--dry-run", "--apply"].includes(option)) {
 		options.set(option, true);
 		continue;
 	}
-	if (!["--since", "--target", "--deployment"].includes(option))
+	if (!["--since", "--target", "--deployment", "--report"].includes(option))
 		throw new Error(`Option inconnue : ${option}`);
 	const value = args[++index];
 	if (!value || value.startsWith("--"))
@@ -37,14 +45,38 @@ if (deploymentId && !targetId)
 	throw new Error("--deployment nécessite --target.");
 if (command === "serve" && options.size)
 	throw new Error("Les filtres sont réservés à la commande sync.");
-const dryRun = args.includes("--dry-run") || process.env.DRY_RUN === "true";
+if (
+	command !== "backfill" &&
+	(options.has("--apply") || options.has("--report"))
+)
+	throw new Error("--apply et --report sont réservés au rattrapage backfill.");
+if (
+	options.has("--apply") &&
+	(options.has("--dry-run") || process.env.DRY_RUN === "true")
+)
+	throw new Error("--apply incompatible avec --dry-run ou DRY_RUN=true.");
+const dryRun =
+	options.has("--dry-run") ||
+	process.env.DRY_RUN === "true" ||
+	(command === "backfill" && !options.has("--apply"));
 const statePath = resolve(process.env.STATE_FILE ?? "./data/state.json");
 const dokployUrl = new URL(required("DOKPLOY_URL"));
 const dokployKey = required("DOKPLOY_API_KEY");
-const githubToken = dryRun ? "" : required("GITHUB_TOKEN");
+const githubToken =
+	dryRun || command === "backfill"
+		? (process.env.GITHUB_TOKEN ?? "")
+		: required("GITHUB_TOKEN");
 const config = JSON.parse(
 	await readFile(process.env.CONFIG_FILE ?? "./config.json", "utf8"),
 );
+validateBacklog(config.backlog);
+if (command === "backfill" && !config.backlog)
+	throw new Error("Configurer backlog avant de lancer le rattrapage.");
+const backlogEnabled =
+	command === "backfill" || config.backlog?.enabled === true;
+const backlogToken = backlogEnabled
+	? process.env.GITHUB_PROJECT_TOKEN || required("GITHUB_TOKEN")
+	: "";
 if (!Array.isArray(config.targets) || !config.targets.length)
 	throw new Error("Configurer au moins une cible.");
 const identities = new Set();
@@ -143,6 +175,34 @@ try {
 } catch (error) {
 	if (error.code !== "ENOENT") throw error;
 }
+const backlogKey = config.backlog
+	? JSON.stringify([
+			config.backlog.organization,
+			config.backlog.projectNumber,
+			config.backlog.field,
+		])
+	: null;
+if (
+	state.backlogs !== undefined &&
+	(!state.backlogs ||
+		typeof state.backlogs !== "object" ||
+		Array.isArray(state.backlogs))
+)
+	throw new Error("État de synchronisation du backlog invalide.");
+const reportPath = options.has("--report")
+	? resolve(options.get("--report"))
+	: null;
+if (
+	reportPath &&
+	[
+		statePath,
+		resolve(process.env.CONFIG_FILE ?? "./config.json"),
+		resolve(".env"),
+	].includes(reportPath)
+)
+	throw new Error(
+		"Le rapport ne doit pas remplacer l'état ou la configuration.",
+	);
 let queue = Promise.resolve();
 let periodicPending = false;
 let syncRequested = false;
@@ -176,16 +236,21 @@ async function request(url, headers, body) {
 		redirect: "error",
 	});
 	// Ne pas journaliser les corps de réponse : ils peuvent contenir des données privées.
-	if (!response.ok)
-		throw new Error(`${new URL(url).pathname}: HTTP ${response.status}`);
+	if (!response.ok) {
+		const error = new Error(
+			`${new URL(url).pathname}: HTTP ${response.status}`,
+		);
+		error.status = response.status;
+		throw error;
+	}
 	return response.json();
 }
 
-function github(path, body) {
+function github(path, body, token = githubToken) {
 	return request(
 		`https://api.github.com${path}`,
 		{
-			Authorization: `Bearer ${githubToken}`,
+			Authorization: `Bearer ${token}`,
 			Accept: "application/vnd.github+json",
 			"X-GitHub-Api-Version": "2026-03-10",
 			"User-Agent": "deployment-tracker",
@@ -297,6 +362,22 @@ async function remoteDeployments(targets) {
 }
 
 async function sync() {
+	const backlogDeployments = [];
+	let historyFailed = false;
+	// Le suivi courant commence à l'activation ; le rattrapage reste explicite.
+	let activatedAt;
+	if (backlogEnabled && command !== "backfill") {
+		state.backlogs ??= {};
+		activatedAt =
+			state.backlogs[backlogKey]?.activatedAt ?? new Date().toISOString();
+		if (!Number.isFinite(Date.parse(activatedAt)))
+			throw new Error("Date d'activation du backlog invalide.");
+		if (!state.backlogs[backlogKey]) {
+			state.backlogs[backlogKey] = { activatedAt };
+			if (!dryRun) await saveState();
+			log("backlog_activated", { activatedAt, dryRun });
+		}
+	}
 	const summary = {
 		created: 0,
 		updated: 0,
@@ -365,22 +446,48 @@ async function sync() {
 				const key = sourceKey(service, dokployUrl.origin);
 				sources[key] = latestAttempts(normalized, sources[key]);
 			}
-			if (!dryRun) {
+			if (!dryRun && command !== "backfill") {
 				state.sources = sources;
 				await saveState();
 			}
-			const remote = dryRun ? new Map() : await remoteDeployments(targets);
-			for (const deployment of groupedDeployments(
+			const deployments = groupedDeployments(
 				targets,
 				sources,
 				dokployUrl.origin,
-			)) {
-				if (selectedSha && deployment.sha !== selectedSha) continue;
-				if (
-					since !== undefined &&
-					Date.parse(deployment.finishedAt ?? deployment.createdAt) < since
-				)
-					continue;
+			).filter(
+				(deployment) =>
+					(!selectedSha || deployment.sha === selectedSha) &&
+					(since === undefined ||
+						Date.parse(deployment.finishedAt ?? deployment.createdAt) >= since),
+			);
+			backlogDeployments.push(
+				...deployments
+					.filter(
+						(deployment) =>
+							!activatedAt ||
+							Date.parse(deployment.finishedAt ?? deployment.createdAt) >=
+								Date.parse(activatedAt),
+					)
+					.map((deployment) => ({
+						...deployment,
+						repository: target.repository,
+						environment: target.environment,
+					})),
+			);
+			if (command === "backfill") continue;
+			// Un échec de publication Deployments n'empêche pas le suivi du backlog.
+			let remote;
+			try {
+				remote = dryRun ? new Map() : await remoteDeployments(targets);
+			} catch (error) {
+				summary.failed++;
+				log("import_failed", {
+					environment: target.environment,
+					message: error.message,
+				});
+				continue;
+			}
+			for (const deployment of deployments) {
 				if (!deployment.status) {
 					summary.waiting++;
 					continue;
@@ -501,11 +608,43 @@ async function sync() {
 				}
 			}
 		} catch (error) {
+			historyFailed = true;
 			summary.failed++;
 			log("target_failed", {
 				environment: target.environment,
 				message: error.message,
 			});
+		}
+	}
+	if (backlogEnabled) {
+		try {
+			if (historyFailed)
+				throw new Error(
+					"Historique Dokploy incomplet : aucune modification du backlog.",
+				);
+			const report = await syncBacklog({
+				config: config.backlog,
+				deployments: backlogDeployments,
+				client: createBacklogClient((path, body) =>
+					github(path, body, backlogToken),
+				),
+				dryRun,
+				log,
+			});
+			summary.backlog = report.summary;
+			summary.failed += report.summary.failed;
+			if (reportPath) {
+				await mkdir(dirname(reportPath), { recursive: true });
+				await writeFile(
+					reportPath,
+					`${JSON.stringify({ generatedAt: new Date().toISOString(), ...report }, null, 2)}\n`,
+					{ mode: 0o600 },
+				);
+			}
+			log("backlog_complete", { ...report.summary, dryRun });
+		} catch (error) {
+			summary.failed++;
+			log("backlog_failed", { message: error.message });
 		}
 	}
 	log("sync_complete", summary);
@@ -520,7 +659,7 @@ function enqueueSync() {
 	return operation;
 }
 
-if (command === "sync") {
+if (command === "sync" || command === "backfill") {
 	const result = await enqueueSync();
 	process.exitCode = result.failed > 0 ? 1 : 0;
 } else {

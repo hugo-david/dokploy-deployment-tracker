@@ -10,7 +10,9 @@
   "scripts": {
     "start": "node --env-file-if-exists=.env src/index.mjs serve",
     "sync": "node --env-file-if-exists=.env src/index.mjs sync",
-    "check": "node --check src/index.mjs && node --check src/server.mjs && node --check src/grouping.mjs"
+    "backfill": "node --env-file-if-exists=.env src/index.mjs backfill",
+    "test": "node --test",
+    "check": "node --check src/index.mjs && node --check src/server.mjs && node --check src/grouping.mjs && node --check src/backlog.mjs"
   },
   "dependencies": {
     "fastify": "^5.12.5"

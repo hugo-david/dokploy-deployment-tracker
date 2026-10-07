@@ -1,4 +1,19 @@
 {
+  "backlog": {
+    "enabled": false,
+    "organization": "drakkr-team",
+    "projectNumber": 41,
+    "field": "Status",
+    "repositories": { "drakkr-team/2i-group-studio": "dev" },
+    "initialStatuses": ["À clarifier", "Backlog", "Ready", "In progress", "In review"],
+    "protectedStatuses": ["Closed", "Canceled"],
+    "stages": [
+      { "environment": "staging", "status": "In STAGING" },
+      { "environment": "test", "status": "In TEST" },
+      { "environment": "preprod", "status": "In PREPROD" },
+      { "environment": "production", "status": "In PROD" }
+    ]
+  },
   "targets": [
     {
       "type": "application",
