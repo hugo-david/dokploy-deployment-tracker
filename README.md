@@ -174,13 +174,15 @@ Pour utiliser un token distinct, renseigner `GITHUB_PROJECT_TOKEN` dans `.env` e
 
 ### Règles de déplacement
 
-À chaque synchronisation, le tracker examine les issues déjà présentes dans le projet, y compris les issues GitHub fermées dont le statut du projet est encore actif. Il récupère les PR explicitement liées et avance le statut jusqu’au plus haut environnement prouvé :
+À chaque synchronisation, le tracker examine les issues déjà présentes dans le projet, y compris les issues GitHub fermées dont le statut du projet est encore actif. Pour les issues sans sous-issues, il récupère les PR explicitement liées et avance le statut jusqu’au plus haut environnement prouvé :
 
 - Toutes les PR liées non abandonnées doivent être fusionnées vers la branche configurée. Une PR fermée sans fusion est ignorée ; une PR encore ouverte bloque le ticket.
 - Pour un même dépôt, tous les commits nécessaires doivent être inclus dans **une même version** dont chaque service configuré a réussi. Pour plusieurs dépôts, chacun doit avoir une preuve dans le même environnement.
 - Les simples mentions de tickets, les PR de promotion directement liées, les dépôts non configurés et les liens inaccessibles ne constituent pas une preuve exploitable.
 - Les tickets archivés, `Closed`, `Canceled` ou avec un statut non configuré sont ignorés. Un ticket n’est jamais rétrogradé.
 - Le statut et les liens sont relus avant écriture. En cas d’échec, le ticket sera réévalué à la prochaine synchronisation, même si GitHub Deployments était déjà à jour.
+
+Une issue parente suit le statut de déploiement le moins avancé de ses sous-issues directes, sans utiliser ses propres PR. Toutes ses sous-issues doivent être présentes dans le projet, actives et au moins en `In STAGING`. Les parents imbriqués sont traités des enfants vers les parents. Les statuts protégés et la règle de non-rétrogradation s’appliquent aussi aux parents. Le tracker relit les sous-issues et leurs statuts avant de déplacer un parent.
 
 Seul le champ `Status` du projet est modifié. Le tracker ne ferme pas d’issues, n’ajoute pas de tickets au projet, ne déplace pas les cartes de PR et ne change ni les labels ni les autres champs. Il peut avancer directement de `In STAGING` à `In PREPROD` si la livraison en préproduction est prouvée.
 

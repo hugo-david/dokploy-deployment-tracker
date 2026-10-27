@@ -73,7 +73,7 @@ export function validateBacklog(config) {
 
 const itemFields = `id isArchived
 	fieldValueByName(name: $field) { ... on ProjectV2ItemFieldSingleSelectValue { name } }
-	content { __typename ... on Issue { id number title url repository { nameWithOwner } } }`;
+	content { __typename ... on Issue { id number title url repository { nameWithOwner } subIssuesSummary { total } } }`;
 const prFields = `number url state baseRefName mergedAt repository { nameWithOwner }
 	mergeCommit { oid }`;
 
@@ -159,6 +159,27 @@ export function createBacklogClient(github) {
 			);
 			return node;
 		},
+		async subIssues(id) {
+			const issues = [];
+			let cursor = null;
+			do {
+				const { node } = await graphql(
+					`query($id: ID!, $cursor: String) {
+						node(id: $id) { ... on Issue {
+							subIssues(first: 100, after: $cursor) {
+								nodes { id url } pageInfo { hasNextPage endCursor }
+							}
+						} }
+					}`,
+					{ id, cursor },
+				);
+				if (!node?.subIssues) throw new Error("Sous-issues inaccessibles.");
+				issues.push(...node.subIssues.nodes);
+				cursor = nextCursor(node.subIssues);
+			} while (cursor);
+			return issues;
+		},
+
 		async pullRequests(id) {
 			const prs = [];
 			let cursor = null;
@@ -301,7 +322,7 @@ export async function syncBacklog({
 				Date.parse(a.finishedAt ?? a.createdAt),
 		);
 	for (const item of items) {
-		if (item?.content?.__typename !== "Issue") continue;
+		if (item?.content?.__typename !== "Issue" || item.content.subIssuesSummary?.total > 0) continue;
 		const row = {
 			issue: item.content.url,
 			title: item.content.title,
@@ -396,6 +417,7 @@ export async function syncBacklog({
 							eligibility(fresh, config) ||
 							fresh.fieldValueByName?.name !== row.from ||
 							fresh.content.id !== item.content.id ||
+							(fresh.content.subIssuesSummary?.total ?? 0) !== 0 ||
 							signature(prs) !== signature(freshPrs)
 						)
 							row.reason = "changed_during_sync";
@@ -420,6 +442,74 @@ export async function syncBacklog({
 		rows.push(row);
 		log(`backlog_${row.outcome}`, row);
 	}
+	// Traiter les parents après leurs enfants, y compris les parents imbriqués.
+	const byIssue = new Map(items.filter((item) => item.content?.__typename === "Issue")
+		.map((item) => [item.content.id, item]));
+	const rowByIssue = new Map(rows.map((row) => [row.issue, row]));
+	const visiting = new Set();
+	async function processParent(item) {
+		const existing = rowByIssue.get(item.content.url);
+		if (existing) return existing;
+		const row = {
+			issue: item.content.url, title: item.content.title,
+			from: item.fieldValueByName?.name ?? null, to: null,
+			outcome: "skipped", reason: eligibility(item, config), evidence: [],
+		};
+		if (visiting.has(item.content.id)) throw new Error("Cycle de sous-issues détecté.");
+		visiting.add(item.content.id);
+		try {
+			if (blocked) row.reason = "access_blocked";
+			if (!row.reason) {
+				const children = await client.subIssues(item.content.id);
+				if (!children.length || children.length !== item.content.subIssuesSummary.total)
+					row.reason = "sub_issues_changed";
+				const childItems = children.map((child) => byIssue.get(child.id));
+				if (!row.reason && childItems.some((child) => !child)) row.reason = "sub_issue_not_in_project";
+				if (!row.reason) {
+					for (const child of childItems) {
+						if (child.content.subIssuesSummary?.total > 0) await processParent(child);
+					}
+					const ranks = childItems.map((child) => {
+						const childRow = rowByIssue.get(child.content.url);
+						if (!childRow || childRow.outcome === "failed" || eligibility(child, config)) return -1;
+						const status = ["updated", "would_update"].includes(childRow.outcome) ? childRow.to : childRow.from;
+						return config.stages.findIndex((stage) => stage.status === status);
+					});
+					const rank = Math.min(...ranks);
+					const currentRank = config.stages.findIndex((stage) => stage.status === row.from);
+					if (rank < 0) row.reason = "sub_issue_not_deployed";
+					else if (rank <= currentRank) row.reason = "no_higher_proven_stage";
+					else {
+						row.to = config.stages[rank].status;
+						row.evidence = children.map((child, index) => ({ issue: child.url, status: config.stages[ranks[index]].status }));
+						if (dryRun) row.outcome = "would_update";
+						else {
+							const fresh = await client.item(item.id, config.field);
+							const freshChildren = await client.subIssues(item.content.id);
+							const sameChildren = JSON.stringify(children.map((c) => c.id).sort()) === JSON.stringify(freshChildren.map((c) => c.id).sort());
+							let childrenValid = true;
+							for (const child of childItems) {
+								const freshChild = await client.item(child.id, config.field);
+								if (!freshChild || freshChild.content?.id !== child.content.id || eligibility(freshChild, config) || config.stages.findIndex((stage) => stage.status === freshChild.fieldValueByName?.name) < rank) childrenValid = false;
+							}
+							if (!fresh || eligibility(fresh, config) || fresh.content.id !== item.content.id || fresh.fieldValueByName?.name !== row.from || fresh.content.subIssuesSummary?.total !== children.length || !sameChildren || !childrenValid) row.reason = "changed_during_sync";
+							else { await client.update(project, item.id, row.to); row.outcome = "updated"; }
+						}
+					}
+				}
+			}
+		} catch (error) {
+			row.outcome = "failed"; row.reason = error.message;
+			if (["FORBIDDEN", "INSUFFICIENT_SCOPES", "RATE_LIMITED"].includes(error.code) || [401, 403, 429].includes(error.status)) blocked = true;
+		} finally { visiting.delete(item.content.id); }
+		rows.push(row); rowByIssue.set(item.content.url, row);
+		log(`backlog_${row.outcome}`, row);
+		return row;
+	}
+	for (const item of items) {
+		if (item.content?.__typename === "Issue" && item.content.subIssuesSummary?.total > 0) await processParent(item);
+	}
+
 	const summary = { updated: 0, would_update: 0, skipped: 0, failed: 0 };
 	for (const row of rows) summary[row.outcome]++;
 	return {

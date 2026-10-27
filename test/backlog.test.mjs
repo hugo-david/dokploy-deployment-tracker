@@ -318,3 +318,42 @@ test("pagination complète des tickets et PR, erreurs GraphQL même HTTP 200", a
 	}));
 	await assert.rejects(denied.project(config), /FORBIDDEN/);
 });
+
+test("un parent suit le déploiement commun le moins avancé de ses sous-issues", async () => {
+	const parent = item(1);
+	parent.content.subIssuesSummary = { total: 2 };
+	const children = [item(2, "In TEST"), item(3, "In STAGING")];
+	const f = fixture({
+		items: [parent, ...children], prs: [],
+		subIssues: async () => children.map((child) => child.content),
+		update: async (_, id, status) => { f.updates.push([id, status]); },
+	});
+	const result = await run(f, [], false);
+	assert.equal(result.rows.find((row) => row.issue === parent.content.url).to, "In STAGING");
+	assert.deepEqual(f.updates, [[parent.id, "In STAGING"]]);
+});
+
+test("un parent attend chaque sous-issue et respecte les statuts protégés", async () => {
+	const parent = item(1);
+	parent.content.subIssuesSummary = { total: 2 };
+	const child = item(2, "In TEST");
+	const f = fixture({ items: [parent, child], prs: [], subIssues: async () => [child.content, { id: "missing" }] });
+	assert.equal((await run(f, [])).rows.find((row) => row.issue === parent.content.url).reason, "sub_issue_not_in_project");
+	const other = item(3, "Canceled");
+	f.client.items = async () => [parent, child, other];
+	f.client.subIssues = async () => [child.content, other.content];
+	assert.equal((await run(f, [])).rows.find((row) => row.issue === parent.content.url).reason, "sub_issue_not_deployed");
+});
+
+test("les parents imbriqués avancent en simulation et un changement concurrent bloque l'écriture", async () => {
+	const parent = item(1), middle = item(2), child = item(3, "In TEST");
+	parent.content.subIssuesSummary = { total: 1 };
+	middle.content.subIssuesSummary = { total: 1 };
+	const f = fixture({ items: [parent, middle, child], prs: [], subIssues: async (id) => [id === parent.content.id ? middle.content : child.content] });
+	const result = await run(f, []);
+	assert.equal(result.rows.find((row) => row.issue === parent.content.url).to, "In TEST");
+	assert.equal(result.summary.would_update, 2);
+	const g = fixture({ items: [middle, child], prs: [], subIssues: async () => [child.content], item: async (id) => id === child.id ? item(3, "In progress") : middle });
+	assert.equal((await run(g, [], false)).rows.find((row) => row.issue === middle.content.url).reason, "changed_during_sync");
+	assert.equal(g.updates.length, 0);
+});
