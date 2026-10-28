@@ -106,6 +106,44 @@ test("un merge de promotion ne prouve pas la présence d'un squash absent", asyn
 	assert.equal(result.rows[0].to, null);
 });
 
+test("une PR empilée suit les déploiements qui contiennent son commit", async () => {
+	const stacked = pr(1, { baseRefName: "feat/parent", stack: { baseRefName: "dev" } });
+	const f = fixture({
+		prs: [stacked],
+		contains: async (_, ancestor, head) =>
+			ancestor === sha(1) && [sha(10), sha(20), sha(30)].includes(head),
+	});
+	for (const [environment, n, status] of [
+		["staging", 10, "In STAGING"],
+		["test", 20, "In TEST"],
+		["preprod", 30, "In PREPROD"],
+	]) {
+		assert.equal((await run(f, [deployment(environment, n)])).rows[0].to, status);
+	}
+	const absent = fixture({ prs: [stacked], contains: async () => false });
+	assert.equal((await run(absent, [deployment("test", 20)])).rows[0].reason, "no_higher_proven_stage");
+});
+
+test("une pile qui ne cible pas la branche configurée ne permet pas de déplacer le ticket", async () => {
+	const stacked = pr(1, { baseRefName: "feat/parent", stack: { baseRefName: "test" } });
+	assert.equal(
+		(await run(fixture({ prs: [stacked] }), [deployment("test", 20)])).rows[0].reason,
+		"unsupported_pr",
+	);
+});
+
+test("un changement de branche cible de pile pendant la synchronisation bloque l'écriture", async () => {
+	let calls = 0;
+	const f = fixture({
+		pullRequests: async () => [
+			pr(1, { baseRefName: "feat/parent", stack: { baseRefName: ++calls === 1 ? "dev" : "test" } }),
+		],
+	});
+	const result = await run(f, [deployment("test", 20)], false);
+	assert.equal(result.rows[0].reason, "changed_during_sync");
+	assert.equal(f.updates.length, 0);
+});
+
 test("un succès API seul ne déplace aucun ticket", async () => {
 	const targets = ["api", "web"].map((service) => ({
 		repository: repo,
@@ -147,6 +185,7 @@ test("PR ouverte, liens absents ou promotion liée : laisse le ticket en place",
 	for (const [prs, reason] of [
 		[[], "no_linked_pr"],
 		[[pr(1, { state: "OPEN" })], "unmerged_pr"],
+		[[pr(1, { state: "OPEN", baseRefName: "feat/parent", stack: { baseRefName: "dev" } })], "unmerged_pr"],
 		[[pr(1, { baseRefName: "test" })], "unsupported_pr"],
 	]) {
 		const result = await run(fixture({ prs }), [deployment("test", 10)]);
@@ -160,6 +199,26 @@ test("une PR abandonnée ne bloque pas la PR de remplacement fusionnée", async 
 		[deployment("test", 10)],
 	);
 	assert.equal(result.rows[0].to, "In TEST");
+});
+
+test("une PR liée inaccessible bloque le ticket sans masquer les autres", async () => {
+	const f = fixture({
+		items: [item(1), item(2)],
+		pullRequests: async (id) => id === "issue1" ? [pr(), null] : [pr(2)],
+	});
+	const result = await run(f, [deployment("test", 10)], false);
+	assert.equal(result.rows[0].reason, "inaccessible_pr");
+	assert.equal(result.rows[0].outcome, "skipped");
+	assert.equal(result.rows[1].outcome, "updated");
+	assert.equal(f.updates.length, 1);
+});
+
+test("une PR devenue inaccessible avant écriture bloque le déplacement", async () => {
+	let calls = 0;
+	const f = fixture({ pullRequests: async () => ++calls === 1 ? [pr()] : [pr(), null] });
+	const result = await run(f, [deployment("test", 10)], false);
+	assert.equal(result.rows[0].reason, "changed_during_sync");
+	assert.equal(f.updates.length, 0);
 });
 
 test("ne rétrograde pas, protège Closed, Canceled, les archives et les statuts inconnus", async () => {
@@ -296,7 +355,10 @@ test("comparaison GitHub : seuls ahead et identical prouvent l'inclusion", async
 
 test("pagination complète des tickets et PR, erreurs GraphQL même HTTP 200", async () => {
 	let calls = 0;
-	const client = createBacklogClient(async (_, { variables }) => {
+	const client = createBacklogClient(async (_, { query, variables }) => {
+		if (query.includes("closedByPullRequestsReferences")) {
+			assert.match(query, /stack\s*\{\s*baseRefName\s*\}/);
+		}
 		calls++;
 		const page = {
 			nodes: [variables.cursor ? { id: "second" } : { id: "first" }],

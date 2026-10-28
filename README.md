@@ -90,7 +90,7 @@ Pour tester localement : `ngrok http 3000`, puis utiliser l’URL du tunnel suiv
 
 ## Suivi des tickets dans GitHub Projects
 
-Le tracker suit les PR de fonctionnalité **squashées vers `dev`**, puis promues par **merge commits de `dev` vers `test`, puis de `test` vers préproduction**. Le commit résultant du squash est conservé dans les promotions. La comparaison GitHub vérifie son ascendance par rapport au commit réellement déployé ; le dernier commit seul ou le titre d’une PR ne suffisent pas.
+Le tracker suit les PR de fonctionnalité fusionnées vers `dev`, y compris les PR d'une pile GitHub dont la branche cible est `dev`, puis promues par **merge commits de `dev` vers `test`, puis de `test` vers préproduction**. La comparaison GitHub vérifie que le commit de fusion de chaque PR est un ancêtre du commit réellement déployé ; le dernier commit seul ou le titre d’une PR ne suffisent pas. Une promotion par squash ou rebase peut modifier l'historique et empêcher cette preuve.
 
 ```text
 PR feature ── squash ──> dev / STAGING
@@ -176,9 +176,10 @@ Pour utiliser un token distinct, renseigner `GITHUB_PROJECT_TOKEN` dans `.env` e
 
 À chaque synchronisation, le tracker examine les issues déjà présentes dans le projet, y compris les issues GitHub fermées dont le statut du projet est encore actif. Pour les issues sans sous-issues, il récupère les PR explicitement liées et avance le statut jusqu’au plus haut environnement prouvé :
 
-- Toutes les PR liées non abandonnées doivent être fusionnées vers la branche configurée. Une PR fermée sans fusion est ignorée ; une PR encore ouverte bloque le ticket.
+- Toutes les PR liées non abandonnées doivent être fusionnées vers la branche configurée, directement ou dans une pile GitHub qui la cible. Une PR fermée sans fusion est ignorée ; une PR encore ouverte bloque le ticket.
 - Pour un même dépôt, tous les commits nécessaires doivent être inclus dans **une même version** dont chaque service configuré a réussi. Pour plusieurs dépôts, chacun doit avoir une preuve dans le même environnement.
 - Les simples mentions de tickets, les PR de promotion directement liées, les dépôts non configurés et les liens inaccessibles ne constituent pas une preuve exploitable.
+- Si GitHub renvoie une PR liée inaccessible, le ticket reste en place avec le motif `inaccessible_pr` ; vérifier l'accès du token aux dépôts concernés.
 - Les tickets archivés, `Closed`, `Canceled` ou avec un statut non configuré sont ignorés. Un ticket n’est jamais rétrogradé.
 - Le statut et les liens sont relus avant écriture. En cas d’échec, le ticket sera réévalué à la prochaine synchronisation, même si GitHub Deployments était déjà à jour.
 

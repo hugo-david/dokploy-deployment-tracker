@@ -75,7 +75,7 @@ const itemFields = `id isArchived
 	fieldValueByName(name: $field) { ... on ProjectV2ItemFieldSingleSelectValue { name } }
 	content { __typename ... on Issue { id number title url repository { nameWithOwner } subIssuesSummary { total } } }`;
 const prFields = `number url state baseRefName mergedAt repository { nameWithOwner }
-	mergeCommit { oid }`;
+	mergeCommit { oid } stack { baseRefName }`;
 
 export function createBacklogClient(github) {
 	async function graphql(query, variables) {
@@ -269,7 +269,10 @@ function eligibility(item, config) {
 function signature(prs) {
 	return JSON.stringify(
 		prs
-			.map((pr) => [pr.url, pr.state, pr.baseRefName, pr.mergeCommit?.oid])
+			.map((pr) => [
+				pr.url, pr.state, pr.baseRefName, pr.stack?.baseRefName,
+				pr.repository.nameWithOwner, pr.mergeCommit?.oid,
+			])
 			.sort(),
 	);
 }
@@ -278,10 +281,12 @@ function signature(prs) {
 // abandonnée ; une PR de promotion ou un dépôt inconnu rend la preuve ambiguë.
 function prEligibility(prs, config) {
 	if (!prs.length) return "no_linked_pr";
+	if (prs.some((pr) => !pr)) return "inaccessible_pr";
 	if (
 		prs.some(
 			(pr) =>
-				config.repositories[pr.repository.nameWithOwner] !== pr.baseRefName,
+				config.repositories[pr.repository.nameWithOwner] !==
+				(pr.stack?.baseRefName ?? pr.baseRefName),
 		)
 	)
 		return "unsupported_pr";
@@ -336,7 +341,7 @@ export async function syncBacklog({
 			if (blocked) row.reason = "access_blocked";
 			if (!row.reason) {
 				const prs = (await client.pullRequests(item.content.id)).filter(
-					(pr) => pr.state !== "CLOSED",
+					(pr) => !pr || pr.state !== "CLOSED",
 				);
 				row.reason = prEligibility(prs, config);
 				if (!row.reason) {
@@ -409,7 +414,7 @@ export async function syncBacklog({
 							fresh?.content?.id === item.content.id &&
 							!eligibility(fresh, config)
 								? (await client.pullRequests(item.content.id)).filter(
-										(pr) => pr.state !== "CLOSED",
+										(pr) => !pr || pr.state !== "CLOSED",
 									)
 								: [];
 						if (
@@ -418,6 +423,7 @@ export async function syncBacklog({
 							fresh.fieldValueByName?.name !== row.from ||
 							fresh.content.id !== item.content.id ||
 							(fresh.content.subIssuesSummary?.total ?? 0) !== 0 ||
+							freshPrs.some((pr) => !pr) ||
 							signature(prs) !== signature(freshPrs)
 						)
 							row.reason = "changed_during_sync";
