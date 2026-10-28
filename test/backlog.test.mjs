@@ -80,6 +80,8 @@ test("configuration : ordre explicite, statuts protégés et doublons", () => {
 		}),
 	);
 	assert.throws(() => validateBacklog({ ...config, protectedStatuses: [] }));
+	assert.throws(() => validateBacklog({ ...config, ignoredRepositories: [repo] }));
+	assert.throws(() => validateBacklog({ ...config, ignoredRepositories: ["invalide"] }));
 });
 
 test("squash conservé par les promotions : choisit le plus haut succès, sans écriture en simulation", async () => {
@@ -211,6 +213,28 @@ test("une PR liée inaccessible bloque le ticket sans masquer les autres", async
 	assert.equal(result.rows[0].outcome, "skipped");
 	assert.equal(result.rows[1].outcome, "updated");
 	assert.equal(f.updates.length, 1);
+});
+
+test("un dépôt explicitement ignoré ne nécessite pas de preuve de déploiement", async () => {
+	const odoo = pr(2, { repository: { nameWithOwner: "drakkr-team/2i-group-odoo" } });
+	const f = fixture({ prs: [pr(), odoo] });
+	const result = await syncBacklog({
+		config: { ...config, ignoredRepositories: ["drakkr-team/2i-group-odoo"] },
+		client: f.client, deployments: [deployment("test", 10)], dryRun: true,
+	});
+	assert.equal(result.rows[0].to, "In TEST");
+	assert.equal(result.rows[0].evidence[0].pullRequests.length, 1);
+});
+
+test("ignorer un dépôt ne suffit pas sans PR suivie ni avec une PR inaccessible", async () => {
+	const odoo = pr(2, { repository: { nameWithOwner: "drakkr-team/2i-group-odoo" } });
+	for (const [prs, reason] of [[[odoo], "no_linked_pr"], [[pr(), null, odoo], "inaccessible_pr"]]) {
+		const result = await syncBacklog({
+			config: { ...config, ignoredRepositories: ["drakkr-team/2i-group-odoo"] },
+			client: fixture({ prs }).client, deployments: [deployment("test", 10)], dryRun: true,
+		});
+		assert.equal(result.rows[0].reason, reason);
+	}
 });
 
 test("une PR devenue inaccessible avant écriture bloque le déplacement", async () => {

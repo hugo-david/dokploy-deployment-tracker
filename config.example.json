@@ -5,6 +5,7 @@
     "projectNumber": 41,
     "field": "Status",
     "repositories": { "drakkr-team/2i-group-studio": "dev" },
+    "ignoredRepositories": ["drakkr-team/2i-group-odoo"],
     "initialStatuses": ["À clarifier", "Backlog", "Ready", "In progress", "In review"],
     "protectedStatuses": ["Closed", "Canceled"],
     "stages": [

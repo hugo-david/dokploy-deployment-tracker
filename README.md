@@ -118,6 +118,7 @@ Ajouter le bloc suivant à la racine du `config.json` existant, **en conservant 
     "projectNumber": 41,
     "field": "Status",
     "repositories": { "drakkr-team/2i-group-studio": "dev" },
+    "ignoredRepositories": ["drakkr-team/2i-group-odoo"],
     "initialStatuses": ["À clarifier", "Backlog", "Ready", "In progress", "In review"],
     "protectedStatuses": ["Closed", "Canceled"],
     "stages": [
@@ -131,6 +132,8 @@ Ajouter le bloc suivant à la racine du `config.json` existant, **en conservant 
 ```
 
 Ce bloc est aussi fourni dans `config.example.json`, avec `enabled: false` par défaut. `repositories` associe chaque dépôt à la branche cible des PR de fonctionnalité (`dev`). `stages` définit, dans l’ordre croissant, la correspondance environnement/statut. Les noms d’environnement doivent correspondre à ceux des `targets` et les noms de statuts à ceux du projet, majuscules comprises.
+
+`ignoredRepositories` permet d'ignorer les PR du dépôt Odoo : seul le déploiement Studio est vérifié, sans garantie que les changements Odoo soient livrés. Le token doit pouvoir lire les PR Odoo pour que GitHub identifie leur dépôt. Les PR inaccessibles restent bloquantes, et au moins une PR d'un dépôt suivi est nécessaire.
 
 | Environnement Dokploy configuré | Statut cible |
 | --- | --- |

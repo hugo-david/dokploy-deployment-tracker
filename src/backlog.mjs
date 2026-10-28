@@ -49,6 +49,11 @@ export function validateBacklog(config) {
 		throw new Error(
 			"backlog.repositories : associer chaque dépôt à sa branche de développement.",
 		);
+	if (config.ignoredRepositories !== undefined &&
+		(!Array.isArray(config.ignoredRepositories) ||
+			config.ignoredRepositories.some((repo) => typeof repo !== "string" || !/^[\w.-]+\/[\w.-]+$/.test(repo) || Object.hasOwn(config.repositories, repo)) ||
+			new Set(config.ignoredRepositories).size !== config.ignoredRepositories.length))
+		throw new Error("backlog.ignoredRepositories : dépôts distincts et non suivis requis.");
 	for (const field of ["initialStatuses", "protectedStatuses"]) {
 		if (
 			!Array.isArray(config[field]) ||
@@ -340,8 +345,11 @@ export async function syncBacklog({
 		try {
 			if (blocked) row.reason = "access_blocked";
 			if (!row.reason) {
-				const prs = (await client.pullRequests(item.content.id)).filter(
+				const linkedPrs = (await client.pullRequests(item.content.id)).filter(
 					(pr) => !pr || pr.state !== "CLOSED",
+				);
+				const prs = linkedPrs.filter((pr) =>
+					!pr || !config.ignoredRepositories?.includes(pr.repository.nameWithOwner),
 				);
 				row.reason = prEligibility(prs, config);
 				if (!row.reason) {
@@ -424,7 +432,7 @@ export async function syncBacklog({
 							fresh.content.id !== item.content.id ||
 							(fresh.content.subIssuesSummary?.total ?? 0) !== 0 ||
 							freshPrs.some((pr) => !pr) ||
-							signature(prs) !== signature(freshPrs)
+							signature(linkedPrs) !== signature(freshPrs)
 						)
 							row.reason = "changed_during_sync";
 						else {
